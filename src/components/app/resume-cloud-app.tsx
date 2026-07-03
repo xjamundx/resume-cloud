@@ -12,6 +12,8 @@ import {
   FileText,
   LayoutPanelTop,
   LetterText,
+  LogOut,
+  Mail,
   Moon,
   Printer,
   Save,
@@ -26,7 +28,7 @@ import { persist } from "zustand/middleware";
 
 import { createHtmlExport, parseDocument } from "@/lib/markdown";
 import { SAMPLE_DOCUMENTS } from "@/lib/sample-data";
-import type { DocumentKind, StoredDocument, ThemeId } from "@/lib/types";
+import type { DocumentKind, ParsedDocument, StoredDocument, ThemeId } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const MAX_DOCUMENTS_PER_KIND = 25;
@@ -34,61 +36,109 @@ const MAX_DOCUMENT_SIZE_BYTES = 10 * 1024;
 
 type ViewMode = "split" | "edit" | "preview";
 type AppTheme = "light" | "dark";
-type DraftState = {
-  name: string;
-  content: string;
-  themeId: ThemeId;
-};
 
-type DocumentStoreState = {
+type UserWorkspace = {
+  id: string;
+  email: string;
   documents: StoredDocument[];
   selectedId: string;
+  createdAt: string;
+};
+
+type StoreState = {
   hydrated: boolean;
-  setSelectedId: (id: string) => void;
+  currentUserId: string | null;
+  users: Record<string, UserWorkspace>;
   markHydrated: () => void;
-  createDocument: (kind: DocumentKind) => StoredDocument | null;
+  enterWithEmail: (email: string) => string;
+  signOut: () => void;
+  setSelectedId: (userId: string, documentId: string) => void;
+  createDocument: (userId: string, kind: DocumentKind) => StoredDocument | null;
   saveDocument: (
-    id: string,
+    userId: string,
+    documentId: string,
     patch: Pick<StoredDocument, "name" | "content" | "themeId">,
   ) => { ok: true } | { ok: false; error: string };
 };
 
-const useDocumentStore = create<DocumentStoreState>()(
+const useResumeCloudStore = create<StoreState>()(
   persist(
     (set, get) => ({
-      documents: SAMPLE_DOCUMENTS,
-      selectedId: SAMPLE_DOCUMENTS[0].id,
       hydrated: false,
-      setSelectedId: (selectedId) => set({ selectedId }),
+      currentUserId: null,
+      users: {},
       markHydrated: () => set({ hydrated: true }),
-      createDocument: (kind) => {
-        const documents = get().documents;
-        const count = documents.filter((document) => document.kind === kind).length;
+      enterWithEmail: (email) => {
+        const normalizedEmail = normalizeEmail(email);
+        const userId = createUserId(normalizedEmail);
+        const existingUser = get().users[userId];
+
+        set((state) => ({
+          currentUserId: userId,
+          users: existingUser
+            ? state.users
+            : {
+                ...state.users,
+                [userId]: {
+                  id: userId,
+                  email: normalizedEmail,
+                  documents: cloneSampleDocuments(),
+                  selectedId: SAMPLE_DOCUMENTS[0].id,
+                  createdAt: new Date().toISOString(),
+                },
+              },
+        }));
+
+        return userId;
+      },
+      signOut: () => set({ currentUserId: null }),
+      setSelectedId: (userId, documentId) =>
+        set((state) => ({
+          users: {
+            ...state.users,
+            [userId]: {
+              ...state.users[userId],
+              selectedId: documentId,
+            },
+          },
+        })),
+      createDocument: (userId, kind) => {
+        const user = get().users[userId];
+        if (!user) {
+          return null;
+        }
+
+        const count = user.documents.filter((document) => document.kind === kind).length;
         if (count >= MAX_DOCUMENTS_PER_KIND) {
           return null;
         }
 
-        const createdAt = new Date().toISOString();
-        const id = `${kind}-${crypto.randomUUID()}`;
+        const timestamp = new Date().toISOString();
         const document: StoredDocument = {
-          id,
+          id: `${kind}-${crypto.randomUUID()}`,
           kind,
           name: kind === "resume" ? "New Resume" : "New Cover Letter",
           content: kind === "resume" ? resumeTemplate() : coverLetterTemplate(),
           themeId: kind === "resume" ? "signal" : "paper",
-          createdAt,
-          updatedAt: createdAt,
-          lastSavedAt: createdAt,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          lastSavedAt: timestamp,
         };
 
-        set({
-          documents: [document, ...documents],
-          selectedId: id,
-        });
+        set((state) => ({
+          users: {
+            ...state.users,
+            [userId]: {
+              ...state.users[userId],
+              selectedId: document.id,
+              documents: [document, ...state.users[userId].documents],
+            },
+          },
+        }));
 
         return document;
       },
-      saveDocument: (id, patch) => {
+      saveDocument: (userId, documentId, patch) => {
         const size = new TextEncoder().encode(patch.content).length;
         if (size > MAX_DOCUMENT_SIZE_BYTES) {
           return {
@@ -101,25 +151,31 @@ const useDocumentStore = create<DocumentStoreState>()(
 
         const timestamp = new Date().toISOString();
         set((state) => ({
-          documents: state.documents
-            .map((document) =>
-              document.id === id
-                ? {
-                    ...document,
-                    ...patch,
-                    updatedAt: timestamp,
-                    lastSavedAt: timestamp,
-                  }
-                : document,
-            )
-            .sort((a, b) => b.lastSavedAt.localeCompare(a.lastSavedAt)),
+          users: {
+            ...state.users,
+            [userId]: {
+              ...state.users[userId],
+              documents: state.users[userId].documents
+                .map((document) =>
+                  document.id === documentId
+                    ? {
+                        ...document,
+                        ...patch,
+                        updatedAt: timestamp,
+                        lastSavedAt: timestamp,
+                      }
+                    : document,
+                )
+                .sort((a, b) => b.lastSavedAt.localeCompare(a.lastSavedAt)),
+            },
+          },
         }));
 
         return { ok: true };
       },
     }),
     {
-      name: "resume-cloud-documents",
+      name: "resume-cloud-store",
       onRehydrateStorage: () => (state) => {
         state?.markHydrated();
       },
@@ -139,14 +195,15 @@ const THEMES: Array<{
 
 export function ResumeCloudApp() {
   const {
-    documents,
-    selectedId,
     hydrated,
+    currentUserId,
+    users,
+    enterWithEmail,
+    signOut,
     setSelectedId,
-    saveDocument,
     createDocument,
-  } = useDocumentStore();
-  const [viewMode, setViewMode] = useState<ViewMode>("split");
+    saveDocument,
+  } = useResumeCloudStore();
   const [appTheme, setAppTheme] = useState<AppTheme>(() => {
     if (typeof window === "undefined") {
       return "dark";
@@ -155,57 +212,296 @@ export function ResumeCloudApp() {
     const storedTheme = window.localStorage.getItem("resume-cloud-app-theme");
     return storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
   });
-  const [draftsById, setDraftsById] = useState<Record<string, DraftState>>(() =>
-    Object.fromEntries(
-      SAMPLE_DOCUMENTS.map((document) => [
-        document.id,
-        {
-          name: document.name,
-          content: document.content,
-          themeId: document.themeId,
-        },
-      ]),
-    ),
-  );
-  const [isSaving, setIsSaving] = useState(false);
-  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const selectedDocument = useMemo(
-    () => documents.find((document) => document.id === selectedId) ?? documents[0] ?? null,
-    [documents, selectedId],
-  );
-
-  const resumes = useMemo(
-    () => documents.filter((document) => document.kind === "resume"),
-    [documents],
-  );
-  const coverLetters = useMemo(
-    () => documents.filter((document) => document.kind === "cover-letter"),
-    [documents],
-  );
+  const [email, setEmail] = useState("");
+  const currentUser = currentUserId ? users[currentUserId] ?? null : null;
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", appTheme === "dark");
     window.localStorage.setItem("resume-cloud-app-theme", appTheme);
   }, [appTheme]);
 
-  const activeDraft = selectedDocument
-    ? draftsById[selectedDocument.id] ?? {
-        name: selectedDocument.name,
-        content: selectedDocument.content,
-        themeId: selectedDocument.themeId,
-      }
-    : null;
+  if (!hydrated) {
+    return <div className="min-h-screen bg-[var(--app-background)]" />;
+  }
 
-  const draftName = activeDraft?.name ?? "";
-  const draftContent = activeDraft?.content ?? "";
-  const draftThemeId = activeDraft?.themeId ?? "signal";
+  if (!currentUser) {
+    return (
+      <>
+        <Toaster richColors position="top-right" />
+        <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top_left,_rgba(251,146,60,0.22),_transparent_28%),linear-gradient(180deg,_var(--app-background),_var(--app-background))] px-6 text-slate-900 dark:text-slate-100">
+          <div className="w-full max-w-xl rounded-[2rem] border border-black/5 bg-white/85 p-8 shadow-[0_30px_100px_rgba(15,23,42,0.10)] backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/75">
+            <div className="mb-8 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-orange-600 dark:text-orange-300">
+                  ResumeCloud
+                </p>
+                <h1 className="mt-2 text-3xl font-semibold tracking-tight">
+                  Enter your email and start editing.
+                </h1>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAppTheme((theme) => (theme === "dark" ? "light" : "dark"))}
+                className="rounded-2xl border border-black/5 bg-white p-3 text-slate-700 transition hover:bg-slate-50 dark:border-white/10 dark:bg-slate-900 dark:text-slate-100 dark:hover:bg-slate-800"
+              >
+                {appTheme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+              </button>
+            </div>
+
+            <p className="mb-6 max-w-lg text-sm leading-6 text-slate-600 dark:text-slate-300">
+              No homepage. No marketing funnel. No login flow yet. We just use your email address
+              to generate a unique local user id so you can get right into the builder.
+            </p>
+
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (!isValidEmail(email)) {
+                  toast.error("Enter a valid email address");
+                  return;
+                }
+
+                enterWithEmail(email);
+                toast.success("Workspace ready");
+              }}
+            >
+              <label className="block">
+                <span className="mb-2 block text-sm font-medium">Email address</span>
+                <div className="flex items-center gap-3 rounded-2xl border border-black/5 bg-slate-50 px-4 py-3 dark:border-white/10 dark:bg-slate-900/80">
+                  <Mail className="size-4 text-slate-400" />
+                  <input
+                    type="email"
+                    autoFocus
+                    value={email}
+                    onChange={(event) => setEmail(event.target.value)}
+                    placeholder="you@example.com"
+                    className="w-full bg-transparent outline-none placeholder:text-slate-400"
+                  />
+                </div>
+              </label>
+
+              <button
+                type="submit"
+                className="inline-flex w-full items-center justify-center rounded-2xl bg-slate-900 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800 dark:bg-white dark:text-slate-900 dark:hover:bg-slate-200"
+              >
+                Open Resume Builder
+              </button>
+            </form>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <Workspace
+      appTheme={appTheme}
+      currentUser={currentUser}
+      onThemeToggle={() => setAppTheme((theme) => (theme === "dark" ? "light" : "dark"))}
+      onSignOut={signOut}
+      onSelectDocument={(documentId) => setSelectedId(currentUser.id, documentId)}
+      onCreateDocument={(kind) => createDocument(currentUser.id, kind)}
+      onSaveDocument={(documentId, patch) => saveDocument(currentUser.id, documentId, patch)}
+    />
+  );
+}
+
+function Workspace({
+  appTheme,
+  currentUser,
+  onThemeToggle,
+  onSignOut,
+  onSelectDocument,
+  onCreateDocument,
+  onSaveDocument,
+}: {
+  appTheme: AppTheme;
+  currentUser: UserWorkspace;
+  onThemeToggle: () => void;
+  onSignOut: () => void;
+  onSelectDocument: (documentId: string) => void;
+  onCreateDocument: (kind: DocumentKind) => StoredDocument | null;
+  onSaveDocument: (
+    documentId: string,
+    patch: Pick<StoredDocument, "name" | "content" | "themeId">,
+  ) => { ok: true } | { ok: false; error: string };
+}) {
+  const [viewMode, setViewMode] = useState<ViewMode>("split");
+  const selectedDocument =
+    currentUser.documents.find((document) => document.id === currentUser.selectedId) ??
+    currentUser.documents[0] ??
+    null;
+  const resumes = currentUser.documents.filter((document) => document.kind === "resume");
+  const coverLetters = currentUser.documents.filter((document) => document.kind === "cover-letter");
+
+  if (!selectedDocument) {
+    return null;
+  }
+
+  return (
+    <>
+      <Toaster richColors position="top-right" />
+      <div className="flex min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,146,60,0.18),_transparent_24%),linear-gradient(180deg,_var(--app-background),_var(--app-background))] text-slate-900 transition-colors dark:text-slate-100">
+        <aside className="hidden w-[300px] border-r border-black/5 bg-white/70 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/60 lg:flex lg:flex-col">
+          <div className="mb-4 rounded-3xl border border-black/5 bg-white/80 p-4 shadow-sm dark:border-white/10 dark:bg-slate-900/80">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-orange-600 dark:text-orange-300">
+                  ResumeCloud
+                </p>
+                <h1 className="mt-2 text-lg font-semibold">Resume builder</h1>
+                <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">{currentUser.email}</p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={onThemeToggle}
+                  className="rounded-2xl border border-black/5 bg-white p-2 text-slate-700 transition hover:bg-slate-50 dark:border-white/10 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                >
+                  {appTheme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={onSignOut}
+                  className="rounded-2xl border border-black/5 bg-white p-2 text-slate-700 transition hover:bg-slate-50 dark:border-white/10 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
+                >
+                  <LogOut className="size-4" />
+                </button>
+              </div>
+            </div>
+            <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">
+              Straight into the editor. Your current drafts are scoped to this email-based local workspace.
+            </p>
+          </div>
+
+          <SidebarSection
+            title="Resumes"
+            count={resumes.length}
+            onAdd={() => {
+              const created = onCreateDocument("resume");
+              if (!created) {
+                toast.error("Resume limit reached");
+              }
+            }}
+          >
+            {resumes.map((document) => (
+              <DocumentListItem
+                key={document.id}
+                document={document}
+                active={document.id === selectedDocument.id}
+                onSelect={() => onSelectDocument(document.id)}
+              />
+            ))}
+          </SidebarSection>
+
+          <SidebarSection
+            title="Cover Letters"
+            count={coverLetters.length}
+            onAdd={() => {
+              const created = onCreateDocument("cover-letter");
+              if (!created) {
+                toast.error("Cover letter limit reached");
+              }
+            }}
+          >
+            {coverLetters.map((document) => (
+              <DocumentListItem
+                key={document.id}
+                document={document}
+                active={document.id === selectedDocument.id}
+                onSelect={() => onSelectDocument(document.id)}
+              />
+            ))}
+          </SidebarSection>
+        </aside>
+
+        <EditorWorkspace
+          key={`${currentUser.id}:${selectedDocument.id}`}
+          appTheme={appTheme}
+          selectedDocument={selectedDocument}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          onSaveDocument={onSaveDocument}
+        />
+      </div>
+    </>
+  );
+}
+
+function EditorWorkspace({
+  appTheme,
+  selectedDocument,
+  viewMode,
+  onViewModeChange,
+  onSaveDocument,
+}: {
+  appTheme: AppTheme;
+  selectedDocument: StoredDocument;
+  viewMode: ViewMode;
+  onViewModeChange: (mode: ViewMode) => void;
+  onSaveDocument: (
+    documentId: string,
+    patch: Pick<StoredDocument, "name" | "content" | "themeId">,
+  ) => { ok: true } | { ok: false; error: string };
+}) {
+  const [draftName, setDraftName] = useState(selectedDocument.name);
+  const [draftContent, setDraftContent] = useState(selectedDocument.content);
+  const [draftThemeId, setDraftThemeId] = useState<ThemeId>(selectedDocument.themeId);
+  const [isSaving, setIsSaving] = useState(false);
+  const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const isDirty =
-    !!selectedDocument &&
-    (draftName !== selectedDocument.name ||
-      draftContent !== selectedDocument.content ||
-      draftThemeId !== selectedDocument.themeId);
+    draftName !== selectedDocument.name ||
+    draftContent !== selectedDocument.content ||
+    draftThemeId !== selectedDocument.themeId;
+
+  const parsedPreview = useMemo(
+    () => parseDocument(draftContent, selectedDocument.kind),
+    [draftContent, selectedDocument.kind],
+  );
+
+  const handleSave = useCallback(
+    (silent = false) => {
+      if (!isDirty) {
+        return;
+      }
+
+      setIsSaving(true);
+      const result = onSaveDocument(selectedDocument.id, {
+        name: draftName.trim() || fallbackName(selectedDocument.kind),
+        content: draftContent,
+        themeId: draftThemeId,
+      });
+
+      setIsSaving(false);
+      if (!result.ok) {
+        toast.error(result.error);
+        return;
+      }
+
+      if (!silent) {
+        toast.success("Saved locally");
+      }
+    },
+    [draftContent, draftName, draftThemeId, isDirty, onSaveDocument, selectedDocument.id, selectedDocument.kind],
+  );
+
+  useEffect(() => {
+    if (!isDirty) {
+      return;
+    }
+
+    autosaveTimerRef.current = setTimeout(() => {
+      handleSave(true);
+    }, 5000);
+
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+      }
+    };
+  }, [draftContent, draftName, draftThemeId, handleSave, isDirty]);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -221,87 +517,8 @@ export function ResumeCloudApp() {
     return () => window.removeEventListener("beforeunload", beforeUnload);
   }, [isDirty]);
 
-  const parsedPreview = useMemo(() => {
-    if (!selectedDocument) {
-      return null;
-    }
-
-    return parseDocument(draftContent, selectedDocument.kind);
-  }, [draftContent, selectedDocument]);
-
-  function updateDraft(patch: Partial<DraftState>) {
-    if (!selectedDocument) {
-      return;
-    }
-
-    setDraftsById((current) => ({
-      ...current,
-      [selectedDocument.id]: {
-        name: draftName,
-        content: draftContent,
-        themeId: draftThemeId,
-        ...patch,
-      },
-    }));
-  }
-
-  const handleSave = useCallback(
-    (silent = false) => {
-      if (!selectedDocument || !isDirty) {
-        return;
-      }
-
-      setIsSaving(true);
-      const result = saveDocument(selectedDocument.id, {
-        name: draftName.trim() || fallbackName(selectedDocument.kind),
-        content: draftContent,
-        themeId: draftThemeId,
-      });
-
-      if (!result.ok) {
-        setIsSaving(false);
-        toast.error(result.error);
-        return;
-      }
-
-      setIsSaving(false);
-      if (!silent) {
-        toast.success("Saved locally");
-      }
-    },
-    [draftContent, draftName, draftThemeId, isDirty, saveDocument, selectedDocument],
-  );
-
-  useEffect(() => {
-    if (!selectedDocument || !hydrated) {
-      return;
-    }
-
-    if (autosaveTimerRef.current) {
-      clearTimeout(autosaveTimerRef.current);
-    }
-
-    if (!isDirty) {
-      return;
-    }
-
-    autosaveTimerRef.current = setTimeout(() => {
-      handleSave(true);
-    }, 5000);
-
-    return () => {
-      if (autosaveTimerRef.current) {
-        clearTimeout(autosaveTimerRef.current);
-      }
-    };
-  }, [draftName, draftContent, draftThemeId, handleSave, hydrated, isDirty, selectedDocument]);
-
   async function handleDownload() {
-    if (!selectedDocument) {
-      return;
-    }
-
-    const result = saveDocument(selectedDocument.id, {
+    const result = onSaveDocument(selectedDocument.id, {
       name: draftName.trim() || fallbackName(selectedDocument.kind),
       content: draftContent,
       themeId: draftThemeId,
@@ -329,188 +546,116 @@ export function ResumeCloudApp() {
     URL.revokeObjectURL(url);
   }
 
-  if (!selectedDocument || !parsedPreview) {
-    return null;
-  }
-
   return (
-    <>
-      <Toaster richColors position="top-right" />
-      <div className="flex min-h-screen bg-[radial-gradient(circle_at_top_left,_rgba(251,146,60,0.18),_transparent_24%),linear-gradient(180deg,_var(--app-background),_var(--app-background))] text-slate-900 transition-colors dark:text-slate-100">
-        <aside className="hidden w-[290px] border-r border-black/5 bg-white/70 p-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/60 lg:flex lg:flex-col">
-          <div className="mb-4 rounded-3xl border border-black/5 bg-white/80 p-4 shadow-sm dark:border-white/10 dark:bg-slate-900/80">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.24em] text-orange-600 dark:text-orange-300">
-                  ResumeCloud
-                </p>
-                <h1 className="mt-2 text-lg font-semibold">Markdown document studio</h1>
-              </div>
-              <button
-                type="button"
-                onClick={() => setAppTheme((theme) => (theme === "dark" ? "light" : "dark"))}
-                className="rounded-2xl border border-black/5 bg-white px-3 py-2 text-slate-700 transition hover:bg-slate-50 dark:border-white/10 dark:bg-slate-800 dark:text-slate-100 dark:hover:bg-slate-700"
-              >
-                {appTheme === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
-              </button>
+    <main className="flex min-h-screen flex-1 flex-col">
+      <header className="border-b border-black/5 bg-white/70 px-4 py-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/60 lg:px-6">
+        <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="rounded-2xl border border-black/5 bg-white/80 px-3 py-2 text-xs font-medium text-slate-500 shadow-sm dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300">
+              {selectedDocument.kind === "resume" ? "Resume" : "Cover Letter"}
             </div>
-            <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">
-              Local-first for now. Your drafts stay in this browser until we wire hosted accounts.
-            </p>
+            <input
+              value={draftName}
+              onChange={(event) => setDraftName(event.target.value)}
+              className="min-w-[240px] rounded-2xl border border-black/5 bg-white px-4 py-2 text-sm font-medium shadow-sm outline-none transition focus:border-orange-300 dark:border-white/10 dark:bg-slate-900"
+            />
+            <select
+              value={draftThemeId}
+              onChange={(event) => setDraftThemeId(event.target.value as ThemeId)}
+              className="rounded-2xl border border-black/5 bg-white px-4 py-2 text-sm shadow-sm outline-none transition focus:border-orange-300 dark:border-white/10 dark:bg-slate-900"
+            >
+              {THEMES.map((theme) => (
+                <option key={theme.id} value={theme.id}>
+                  {theme.label}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <SidebarSection
-            title="Resumes"
-            count={resumes.length}
-            onAdd={() => {
-              const created = createDocument("resume");
-              if (!created) {
-                toast.error("Resume limit reached");
-              }
-            }}
-          >
-            {resumes.map((document) => (
-              <DocumentListItem
-                key={document.id}
-                document={document}
-                active={document.id === selectedDocument.id}
-                onSelect={() => setSelectedId(document.id)}
-              />
-            ))}
-          </SidebarSection>
-
-          <SidebarSection
-            title="Cover Letters"
-            count={coverLetters.length}
-            onAdd={() => {
-              const created = createDocument("cover-letter");
-              if (!created) {
-                toast.error("Cover letter limit reached");
-              }
-            }}
-          >
-            {coverLetters.map((document) => (
-              <DocumentListItem
-                key={document.id}
-                document={document}
-                active={document.id === selectedDocument.id}
-                onSelect={() => setSelectedId(document.id)}
-              />
-            ))}
-          </SidebarSection>
-        </aside>
-
-        <main className="flex min-h-screen flex-1 flex-col">
-          <header className="border-b border-black/5 bg-white/70 px-4 py-4 backdrop-blur-xl dark:border-white/10 dark:bg-slate-950/60 lg:px-6">
-            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="rounded-2xl border border-black/5 bg-white/80 px-3 py-2 text-xs font-medium text-slate-500 shadow-sm dark:border-white/10 dark:bg-slate-900/80 dark:text-slate-300">
-                  {selectedDocument.kind === "resume" ? "Resume" : "Cover Letter"}
-                </div>
-                <input
-                  value={draftName}
-                  onChange={(event) => updateDraft({ name: event.target.value })}
-                  className="min-w-[240px] rounded-2xl border border-black/5 bg-white px-4 py-2 text-sm font-medium shadow-sm outline-none ring-0 transition focus:border-orange-300 dark:border-white/10 dark:bg-slate-900"
-                />
-                <select
-                  value={draftThemeId}
-                  onChange={(event) => updateDraft({ themeId: event.target.value as ThemeId })}
-                  className="rounded-2xl border border-black/5 bg-white px-4 py-2 text-sm shadow-sm outline-none transition focus:border-orange-300 dark:border-white/10 dark:bg-slate-900"
-                >
-                  {THEMES.map((theme) => (
-                    <option key={theme.id} value={theme.id}>
-                      {theme.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="flex flex-wrap items-center gap-2">
-                <SegmentButton
-                  active={viewMode === "edit"}
-                  label="Edit"
-                  icon={<FileText className="size-4" />}
-                  onClick={() => setViewMode("edit")}
-                />
-                <SegmentButton
-                  active={viewMode === "split"}
-                  label="Split"
-                  icon={<SplitSquareHorizontal className="size-4" />}
-                  onClick={() => setViewMode("split")}
-                />
-                <SegmentButton
-                  active={viewMode === "preview"}
-                  label="Preview"
-                  icon={<LayoutPanelTop className="size-4" />}
-                  onClick={() => setViewMode("preview")}
-                />
-                <ActionButton disabled={!isDirty} onClick={handleSave} icon={<Save className="size-4" />}>
-                  Save
-                </ActionButton>
-                <ActionButton onClick={() => window.print()} icon={<Printer className="size-4" />}>
-                  Print
-                </ActionButton>
-                <ActionButton onClick={handleDownload} icon={<Download className="size-4" />}>
-                  Download
-                </ActionButton>
-              </div>
-            </div>
-
-            <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
-              <span>{themeLabel(draftThemeId)}</span>
-              <span>{saveStateLabel(isSaving, isDirty, selectedDocument.lastSavedAt)}</span>
-              <span>{formatBytes(new TextEncoder().encode(draftContent).length)} / 10 KB</span>
-            </div>
-          </header>
-
-          <div className="grid flex-1 gap-px bg-black/5 dark:bg-white/10 lg:grid-cols-[1.05fr_0.95fr]">
-            {(viewMode === "edit" || viewMode === "split") && (
-              <section className={panelClassName(viewMode !== "split")}>
-                <div className="border-b border-black/5 px-4 py-3 dark:border-white/10">
-                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500 dark:text-slate-400">
-                    Markdown
-                  </p>
-                </div>
-                <div className="h-[calc(100vh-11rem)] overflow-hidden">
-                  <CodeMirror
-                    value={draftContent}
-                    height="100%"
-                    theme={appTheme === "dark" ? oneDark : "light"}
-                    extensions={[markdown()]}
-                    basicSetup={{
-                      lineNumbers: false,
-                      foldGutter: false,
-                      highlightActiveLineGutter: false,
-                    }}
-                    onChange={(value) => updateDraft({ content: value })}
-                  />
-                </div>
-              </section>
-            )}
-
-            {(viewMode === "preview" || viewMode === "split") && (
-              <section className={panelClassName(viewMode !== "split")}>
-                <div className="border-b border-black/5 px-4 py-3 dark:border-white/10">
-                  <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500 dark:text-slate-400">
-                    Live Preview
-                  </p>
-                  <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                    {THEMES.find((theme) => theme.id === draftThemeId)?.description}
-                  </p>
-                </div>
-                <div className="h-[calc(100vh-11rem)] overflow-auto p-6">
-                  <ResumePreview
-                    parsed={parsedPreview}
-                    themeId={draftThemeId}
-                    kind={selectedDocument.kind}
-                  />
-                </div>
-              </section>
-            )}
+          <div className="flex flex-wrap items-center gap-2">
+            <SegmentButton
+              active={viewMode === "edit"}
+              label="Edit"
+              icon={<FileText className="size-4" />}
+              onClick={() => onViewModeChange("edit")}
+            />
+            <SegmentButton
+              active={viewMode === "split"}
+              label="Split"
+              icon={<SplitSquareHorizontal className="size-4" />}
+              onClick={() => onViewModeChange("split")}
+            />
+            <SegmentButton
+              active={viewMode === "preview"}
+              label="Preview"
+              icon={<LayoutPanelTop className="size-4" />}
+              onClick={() => onViewModeChange("preview")}
+            />
+            <ActionButton disabled={!isDirty} onClick={() => handleSave(false)} icon={<Save className="size-4" />}>
+              Save
+            </ActionButton>
+            <ActionButton onClick={() => window.print()} icon={<Printer className="size-4" />}>
+              Print
+            </ActionButton>
+            <ActionButton onClick={handleDownload} icon={<Download className="size-4" />}>
+              Download
+            </ActionButton>
           </div>
-        </main>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
+          <span>{themeLabel(draftThemeId)}</span>
+          <span>{saveStateLabel(isSaving, isDirty, selectedDocument.lastSavedAt)}</span>
+          <span>{formatBytes(new TextEncoder().encode(draftContent).length)} / 10 KB</span>
+        </div>
+      </header>
+
+      <div className="grid flex-1 gap-px bg-black/5 dark:bg-white/10 lg:grid-cols-[1.05fr_0.95fr]">
+        {(viewMode === "edit" || viewMode === "split") && (
+          <section className={panelClassName(viewMode !== "split")}>
+            <div className="border-b border-black/5 px-4 py-3 dark:border-white/10">
+              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500 dark:text-slate-400">
+                Markdown
+              </p>
+            </div>
+            <div className="h-[calc(100vh-11rem)] overflow-hidden">
+              <CodeMirror
+                value={draftContent}
+                height="100%"
+                theme={appTheme === "dark" ? oneDark : "light"}
+                extensions={[markdown()]}
+                basicSetup={{
+                  lineNumbers: false,
+                  foldGutter: false,
+                  highlightActiveLineGutter: false,
+                }}
+                onChange={(value) => setDraftContent(value)}
+              />
+            </div>
+          </section>
+        )}
+
+        {(viewMode === "preview" || viewMode === "split") && (
+          <section className={panelClassName(viewMode !== "split")}>
+            <div className="border-b border-black/5 px-4 py-3 dark:border-white/10">
+              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500 dark:text-slate-400">
+                Live Preview
+              </p>
+              <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+                {THEMES.find((theme) => theme.id === draftThemeId)?.description}
+              </p>
+            </div>
+            <div className="h-[calc(100vh-11rem)] overflow-auto p-6">
+              <ResumePreview
+                parsed={parsedPreview}
+                themeId={draftThemeId}
+                kind={selectedDocument.kind}
+              />
+            </div>
+          </section>
+        )}
       </div>
-    </>
+    </main>
   );
 }
 
@@ -639,7 +784,7 @@ function ResumePreview({
   themeId,
   kind,
 }: {
-  parsed: ReturnType<typeof parseDocument>;
+  parsed: ParsedDocument;
   themeId: ThemeId;
   kind: DocumentKind;
 }) {
@@ -743,6 +888,28 @@ function formatBytes(bytes: number) {
   }
 
   return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+function normalizeEmail(email: string) {
+  return email.trim().toLowerCase();
+}
+
+function isValidEmail(email: string) {
+  return /\S+@\S+\.\S+/.test(normalizeEmail(email));
+}
+
+function createUserId(email: string) {
+  let hash = 5381;
+
+  for (const char of email) {
+    hash = (hash * 33) ^ char.charCodeAt(0);
+  }
+
+  return `user_${(hash >>> 0).toString(36)}`;
+}
+
+function cloneSampleDocuments() {
+  return SAMPLE_DOCUMENTS.map((document) => ({ ...document }));
 }
 
 function resumeTemplate() {
